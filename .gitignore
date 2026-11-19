@@ -8,3 +8,7 @@ venv/
 .vscode/
 .idea/
 *.log
+
+# Local user preferences (COM/Probe/Rate)
+settings.json
+settings.json.tmp

@@ -1,80 +1,105 @@
-# LS129 UV Monitor / 林上 LS129 紫外線監測軟體
+# LS129 UV Monitor / 林上 LS129 紫外線即時監測軟體
 
-**Version / 版本：v0.1.0 (2026-11-19)**
+**Version / 版本: v0.2.0 · 2026-11-19**  
+**Target / 目標平台: Windows 7 32-bit + Python 3.7.9 + Tkinter + PySerial 3.5**
 
-A Windows desktop application for the **Linshang LS129** UV sensor via **Modbus RTU over RS485**. Designed with the LS128 PC software as an interface reference, but operates as a live monitor and recording tool rather than downloading a historical curve from the meter.
+A desktop monitor for the **Linshang LS129** UV sensor through an **ATK-MO340P USB–RS485** adapter using Modbus RTU. The UI borrows the workflow of LS128, but LS129 is a live sensor: the **PC** is responsible for timestamping and recording each reply.
 
-這是林上 **LS129** 紫外線感測器的 Windows 桌面程式，透過 **RS485 / Modbus RTU** 進行即時監控、量測紀錄與 CSV 匯出。介面參考 LS128，但因 LS129 沒有螢幕、量測資料由電腦端保存，操作流程有所不同。
+林上 LS129 無螢幕，本程式透過 RS485 即時顯示 UV 功率、最大功率、累積能量、曲線，並把每次測試的資料存到電腦。此版本重點是**驗證對外資料刷新頻率**，不宣稱能存取探頭內部的 2048 Hz 原始取樣。
 
-> **Status / 狀態：** Initial prototype. Tested with simulated data and Modbus frame decoding; the program has **not yet been validated end-to-end with a physical LS129**. Do not treat it as a calibrated metrology system without verification.
+> **Prototype / 原型狀態：** Modbus example frames, CRC decoding, local settings and a simulated 20 Hz polling run have been tested. **The v0.2.0 Python application has not yet been validated against the physical LS129.** Do not assume that 20 Hz requests produce 20 new sensor values per second.
 >
-> 初版原型：已做模擬模式及 Modbus 封包解析測試，**尚未以實體 LS129 完成程式端到端驗證**；正式量測使用前請校驗設定、單位及讀值。
+> V0.2 已完成程式與模擬測試；仍須在實體 LS129 現場驗證輪詢成功率、資料格式與單位。
 
-![Interface preview / 介面預覽](docs/interface-preview.png)
+![Earlier interface illustration / V0.1 layout reference](docs/interface-preview.png)
 
-## Features / 功能
+## New in v0.2 / 本版新增
 
-- Live power, peak power and accumulated UV energy / 即時功率、最大功率、累積能量
-- RS485 connection via COM port; 9600 baud, 8N1 by default / COM 連線，預設 9600、8N1
-- Modbus RTU CRC16 verification / Modbus RTU CRC16 驗證
-- INT registers **201–204**, experimental FLOAT registers **101–106** / 整數及實驗性浮點資料讀取
-- Live curve and manual start/stop recording / 即時曲線、手動開始／結束量測
-- Timestamped UTF-8 BOM CSV export / 含時間戳的 CSV（Excel 可開啟）
-- Read / write **smoothing mode** (OFF, 50 Hz, 60 Hz) via register 320, with read-back verification / 光源平滑設定讀寫驗證
-- Software-only EIT comparison factor, **OFF by default** / 預留 EIT 電腦端修正，不寫入探頭
-- Demo mode without hardware / 無硬體模擬模式
+| Feature / 功能 | Behavior / 說明 |
+|---|---|
+| **1 decimal display / 小數第一位** | Show power/peak/energy with conventional half-up rounding (e.g. `21.25 → 21.3`). **Never round raw CSV data.** |
+| **4 / 5 / 20 Hz PC polling** | Select before connecting: every 250 / 200 / 50 ms *target*. Observe **actual received Hz**, not just requested Hz. |
+| **Polling lab / 輪詢實驗頁** | Each received sample: elapsed time, inter-reply interval, values, exact Modbus response HEX, duplicate flag, consecutive repeat run and round-trip latency. |
+| **Auditable CSV / 可追溯 CSV** | One row per attempted poll during a recording (successful or failed), send/receive timestamps, request/response HEX, raw data, software-corrected data, error status. |
+| **Persistent settings / 設定檔** | COM Port, probe type, baud rate, Slave ID, INT/FLOAT mode and selected polling Hz **automatically saved and restored**. |
+| **Simulation / 模擬** | Demo intentionally refreshes its synthetic registers every 200 ms so 20 Hz querying creates repeated values for workflow testing. |
 
-**Safety / 安全：** In v0.1, writes are limited to register **50** (reset peak/energy statistics on measurement start) and **320** (smoothing mode, initiated by user). It never writes the LS129 external calibration register. 本版不會寫入 LS129 外部校正係數。
+**Do not confuse** the PC's requested *polling frequency* with sensor internal *ADC sampling* or the LS129 register refresh rate. 20 Hz is an experiment, not a proven device output capability.
 
-## System requirements / 系統需求
+**注意：** 20 Hz 是電腦向 LS129 發問的目標頻率，不表示探頭有 20 Hz 的新數據；短時段可能受到 RS485 往返延遲、Windows 排程與探頭更新週期影響。
 
-- Windows 7 32-bit target / 以 Windows 7 32-bit 為目標
-- Python 3.7.9 (with Tkinter/Tcl-Tk) / Python 3.7.9，需包含 Tkinter
-- PySerial 3.5 for hardware mode / 實機通訊需 pyserial 3.5
-- USB–RS485 adapter such as **ATK-MO340P** (set to USB-485 mode) / 轉接模組使用 USB-485 模式
-- Proper external power supply to LS129 / LS129 使用適當外部供電
+## Installation / 安裝
 
-### Installation / 安裝
+1. Connect the LS129 to an appropriate external power supply. Switch the ATK-MO340P to **USB-485**; connect the differential RS485 A/B lines correctly.
+2. Close **AccessPort** before launching the application; only one program can own the COM Port at a time.
+3. Install Python 3.7 with Tcl/Tk, then run `python -m pip install -r requirements.txt` (PySerial 3.5).
+4. Launch `python LS129_Monitor.py` or double-click `啟動_LS129.bat`.
+5. Select COM, **physical probe type** (UVALED / UVA / UVC), Baud/Slave ID, and INT or FLOAT data mode. The choices are saved automatically to `settings.json`.
+6. Select **4 Hz, 5 Hz or 20 Hz** while disconnected, then connect. Try **模擬** mode first if no hardware is available.
+7. Press **開始量測**, vary illumination, then **結束並存檔**. Inspect **輪詢實驗 / 逐筆資料** and `Records/*.csv`.
 
-```bash
-python -m pip install -r requirements.txt
-python LS129_Monitor.py
+## Persistent settings / 設定檔保存
+
+- The first valid settings file is stored beside `LS129_Monitor.py` as **`settings.json`** for portable use. If the application directory is read-only, the fallback is `~/LS129_UV_Monitor/settings.json` (Windows user profile).
+- Selecting **COM** or **探頭種類** saves immediately. Baud, Slave, INT/FLOAT and polling frequency are also retained. Manual COM/Slave text is saved on leaving the field, connecting or exiting.
+- On next launch, the last chosen COM and probe are restored even if that COM is **temporarily absent**. The application will *not silently substitute another port* when a saved port is missing.
+- `settings.json` is **excluded from GitHub** by `.gitignore`; each PC maintains its own preferences.
+- **Software EIT correction is disabled on startup**, not auto-restored. No calibration coefficient is written into LS129. Smoothing 0/50/60 Hz is a **device setting**, read from the device after connection, not restored from PC configuration.
+
+Example / 範例（本檔由程式自動產生，無需自行建立）:
+
+```json
+{
+  "baud_rate": "9600",
+  "com_port": "COM5",
+  "data_mode": "FLOAT",
+  "poll_hz": 20,
+  "probe_type": "UVALED",
+  "slave_id": "1"
+}
 ```
 
-You can alternatively launch `啟動_LS129.bat` on Windows. For demo mode, tick **模擬** before connecting. To use the real sensor, close AccessPort or any other application occupying the COM port.
+## CSV output / 資料儲存
 
-Windows 可直接執行 `啟動_LS129.bat`；沒有探頭時先勾選「模擬」。實機連線前請關閉 AccessPort，以免同一 COM Port 被占用。
+Press **結束並存檔** to create a UTF-8 BOM CSV in `Records/`. Notable fields:
 
-### Self-test / 自我測試
+- `send_timestamp`, `receive_timestamp`: wall-clock timestamps, millisecond display precision
+- `elapsed_s`, `rx_gap_ms`, `round_trip_ms`: monotonic elapsed time, successful reply interval, and serial round-trip latency
+- `target_poll_hz`: chosen 4 / 5 / 20 Hz, **not** a claim of actual 20 Hz sensor updates
+- `poll_sequence`, `attempt_index`, `status`, `error`, `source`: attempt numbering, error and periodic/final read
+- `duplicate_previous`, `consecutive_run`: **byte-for-byte comparison of valid Modbus responses**, excluding transport timing; a failed poll breaks the run
+- `power_raw`, `peak_raw`, `energy_raw`: exact decoded numbers without display rounding
+- `power_pc`, `peak_pc`, `energy_pc`, `pc_factor`: software-only correction, recorded separately
+- `request_hex`, `response_hex`: full communication frames, CRC included
+- `probe_type`, `data_mode`, `smoothing`, and other settings for traceability
+
+Data under `Records/` and local `settings.json` are excluded from Git source control.
+
+## What to look for in the 20 Hz experiment / 實驗判讀
+
+If a sensor refreshes accessible registers near **5 Hz**, querying them at **20 Hz** is expected to return repeated values, *approximately* four reads per value. The intervals need not form groups of exactly four, because the PC's polling clock, device refresh and serial response timing are asynchronous. Identical data can also occur during steady illumination; non-identical data alone cannot prove a 20 Hz internal refresh. Compare timestamps, jitter, full HEX frames, and periods of actively changing UV irradiance.
+
+假設 20 Hz 輪詢期間，LS129 真的是每 200 ms 才更新一次 Modbus 暫存器，那麼應有大量連續相同回覆，但**不一定恰好每四筆一組**。要從實測 CSV 判斷，不要只看畫出的曲線。
+
+## Safety & limitations / 安全及限制
+
+- Modbus writes: **register 50** on Start (reset LS129 peak/energy counters), **register 320** only when the user explicitly changes smoothing mode; register 320 write is followed by read-back verification.
+- **Never writes the external calibration register**. EIT is software-only and OFF by default.
+- Starting or stopping a PC recording does not stop physical sensing by LS129.
+- Real LS129 FLOAT register support (101–106), unit scaling, and 20 Hz performance need on-site validation. **INT mode (201–204)** is the known AccessPort baseline; it reports integers, so `21.0` means *integer data rendered to one decimal*, not higher precision.
+- Target: one attached probe. No automated triggering, formal calibration, historical database or PDF reports yet.
+- This release does not contain actual factory measurement data.
+
+## Self-test / 自我測試
 
 ```bash
 python LS129_Monitor.py --self-test
 ```
 
-Expected / 預期：`SELF TEST OK` (CRC16, integer/float decoding, settings response, reset command).
+Validates CRC16, provided INT and FLOAT example frame decoding, rounding, interval selection, duplicate classification, and settings file read/write using a temporary folder.
 
-## Data output / 資料輸出
+## Protocol reference / 原廠通訊協議
 
-Upon **結束並存檔**, the app creates `Records/*.csv` with original readings (`*_raw`), PC-corrected values (`*_pc`), correction factor, timestamp, probe settings and `response_hex`. `Records/` is excluded from version control to avoid accidentally publishing measurement data.
+[LS129 Communication Protocol V3.2](https://images.linshangtech.com/user-manual/LS129_Communication_Protocol_V3.2.pdf)
 
-按「結束並存檔」後自動建立 `Records/*.csv`，同時保存原始值、電腦端修正值、時間戳、探頭設定和通訊回覆封包。`Records/` 不會納入 Git，以避免將實測資料意外公開。
-
-## Known limitations / 目前限制
-
-- **4 Hz target polling**, not a guaranteed hardware data rate / 預設每 250 ms 輪詢，實際時間會受系統與通訊延遲影響
-- Curve points are PC-received Modbus values, **not** the LS129 internal 2048 Hz measurements / 曲線並非探頭內部 2048 Hz 原始資料
-- The actual LS129 FLOAT response format, units and measurement behavior require device verification / FLOAT 格式、單位與實機行為仍待確認
-- One sensor only; no history browser, automatic trigger or PDF reports / 目前單探頭，尚無自動觸發與 PDF 報表
-- EIT correction is PC-side only; no writing calibration coefficients to the device / EIT 只在軟體端修正
-
-## Planned validation / 下一步測試構想（未實作）
-
-- Display power/peak/energy rounded to one decimal place, while preserving full precision in raw recordings / 主畫面顯示到小數第一位，原始資料不捨入
-- Compare Modbus polling at 4, 5 and **20 Hz** under changing illumination, preserving each query's timestamp, raw response and duplicate patterns / 比較 4、5、20 Hz 輪詢，保留每筆時間戳、HEX 回覆及重複值分布
-- **Important:** if LS129 refreshes at 5 Hz, 20 Hz polling may produce approximately four identical readings per update, but not necessarily groups of exactly four due to asynchronous clocks and serial latency / 20 Hz 輪詢不保證四筆恰好一組，需實測時戳與回覆值
-
-## Protocol / 通訊協議
-
-[Linshang LS129 Communication Protocol V3.2](https://images.linshangtech.com/user-manual/LS129_Communication_Protocol_V3.2.pdf)
-
-No license is assigned in this first release; licensing is left to the repository owner. / 本版尚未指定授權條款，由專案擁有者決定。
+No license has been chosen by the repository owner. / 授權條款尚待專案擁有者決定。

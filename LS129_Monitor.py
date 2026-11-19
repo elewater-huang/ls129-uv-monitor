@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LS129 UV Monitor 0.1 - Windows 7 / Python 3.7 compatible.
+"""LS129 UV Monitor 0.2 - Windows 7 / Python 3.7 compatible.
 
 Requires pyserial for real RS485 communication. Demo mode requires only tkinter.
 Protocol reference: Linshang LS129 Communication Protocol V3.2.
@@ -11,6 +11,8 @@ import csv
 import datetime as dt
 import math
 import os
+import json
+from decimal import Decimal, ROUND_HALF_UP
 import queue
 import random
 import struct
@@ -25,9 +27,12 @@ try:
 except ImportError:
     raise SystemExit('tkinter is required. Install a Python distribution with Tcl/Tk.')
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-POLL_SECONDS = 0.25  # 200 ms is LS129's advertised data refresh, not a guaranteed PC rate.
+POLL_RATES = (4, 5, 20)  # PC query targets, NOT the LS129 internal sample rate.
+DEMO_REFRESH_SECONDS = 0.20  # Simulate one sensor update every 200 ms.
+PREF_FILENAME = 'settings.json'  # Local application settings, never written to LS129.
+
 
 
 def crc16_modbus(data):
@@ -90,6 +95,26 @@ def number(value):
     return '{:,.3f}'.format(value).rstrip('0').rstrip('.') if abs(value) < 1000000 else '{:,.1f}'.format(value)
 
 
+def display_number(value):
+    """One decimal place on screen; original floats remain intact in CSV."""
+    if value is None:
+        return '--'
+    # Decimal(str()) ensures conventional 四捨五入, including exact x.x5 ties.
+    v = Decimal(str(value)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)
+    return '{:,.1f}'.format(v)
+
+
+def fixed_poll_interval(hz):
+    if hz not in POLL_RATES:
+        raise ValueError('輪詢頻率只支援 4、5 或 20 Hz')
+    return 1.0 / float(hz)
+
+
+def duplicate_frame(previous, current):
+    """Only identical response bytes prove an identical Modbus value payload."""
+    return bool(previous is not None and current is not None and previous == current)
+
+
 def unit_labels(probe):
     if probe == 'UVC':
         return ('µW/cm²', 'µJ/cm²')
@@ -98,9 +123,79 @@ def unit_labels(probe):
     return ('未指定', '未指定')
 
 
+def preference_paths(app_dir=APP_DIR):
+    """Prefer portable configuration next to the script, fallback to user profile."""
+    home_path = os.path.join(os.path.expanduser('~'), 'LS129_UV_Monitor', PREF_FILENAME)
+    return [os.path.join(app_dir, PREF_FILENAME), home_path]
+
+
+def normalize_preferences(data):
+    """Never trust values read from hand-edited or corrupt JSON."""
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    port = data.get('com_port')
+    if isinstance(port, str) and port.strip() and len(port.strip()) < 100:
+        out['com_port'] = port.strip()
+    if data.get('probe_type') in ('未指定', 'UVA', 'UVALED', 'UVC'):
+        out['probe_type'] = data['probe_type']
+    baud = str(data.get('baud_rate', ''))
+    if baud in ('4800', '9600', '19200', '38400'):
+        out['baud_rate'] = baud
+    slave = str(data.get('slave_id', ''))
+    try:
+        if 1 <= int(slave) <= 247:
+            out['slave_id'] = str(int(slave))
+    except (ValueError, TypeError):
+        pass
+    if data.get('data_mode') in ('INT', 'FLOAT'):
+        out['data_mode'] = data['data_mode']
+    rate = str(data.get('poll_hz', ''))
+    if rate in ('4', '5', '20'):
+        out['poll_hz'] = int(rate)
+    return out
+
+
+def load_preferences(paths=None):
+    for path in (paths or preference_paths()):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as fp:
+                payload = json.load(fp)
+            return normalize_preferences(payload), path, None
+        except (OSError, ValueError, TypeError) as exc:
+            return {}, path, str(exc)
+    return {}, None, None
+
+
+def write_preferences(preferences, paths=None):
+    """Atomic UTF-8 write. A read-only installation can use user profile."""
+    sanitized = normalize_preferences(preferences)
+    last_error = None
+    for path in (paths or preference_paths()):
+        temp = path + '.tmp'
+        try:
+            folder = os.path.dirname(path)
+            if not os.path.isdir(folder):
+                os.makedirs(folder)
+            with open(temp, 'w', encoding='utf-8') as fp:
+                json.dump(sanitized, fp, ensure_ascii=False, indent=2, sort_keys=True)
+                fp.write('\n')
+            os.replace(temp, path)
+            return path
+        except OSError as exc:
+            last_error = exc
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+    raise IOError('無法寫入設定檔: {}'.format(last_error))
+
+
 class LinkWorker(threading.Thread):
     """Owns the serial port. GUI never touches the port directly."""
-    def __init__(self, commands, events, stop_event, port, baud, slave, mode, demo):
+    def __init__(self, commands, events, stop_event, port, baud, slave, mode, demo, poll_hz):
         threading.Thread.__init__(self, daemon=True)
         self.commands = commands
         self.events = events
@@ -110,6 +205,12 @@ class LinkWorker(threading.Thread):
         self.slave = slave
         self.mode = mode
         self.demo = demo
+        self.poll_hz = poll_hz
+        self.poll_seconds = fixed_poll_interval(poll_hz)
+        self.poll_seq = 0
+        self.last_exchange_meta = {}
+        self.demo_last_tick = -1
+        self.demo_values = (0.0, 0.0, 0.0)
         self.serial_port = None
         self.smoothing = 0
         self.sim_t0 = time.monotonic()
@@ -125,6 +226,11 @@ class LinkWorker(threading.Thread):
     def exchange(self, payload, func, register_count=None):
         tx = frame(payload)
         self.serial_port.reset_input_buffer()
+        tx_time = time.time()
+        begin = time.monotonic()
+        self.last_exchange_meta = dict(tx_hex=as_hex(tx), response_hex='',
+                                       tx_timestamp=tx_time, rx_timestamp=None,
+                                       rx_monotonic=None, rtt_ms=None)
         self.serial_port.write(tx)
         self.serial_port.flush()
         header = self.serial_port.read(3)
@@ -138,9 +244,12 @@ class LinkWorker(threading.Thread):
                 raise IOError('Unexpected byte count {}'.format(header[2]))
             rest = self.serial_port.read(wanted + 2)
         else:
-            # FC06 response 8 bytes total.
             rest = self.serial_port.read(5)
         rx = header + rest
+        rx_mono = time.monotonic()
+        self.last_exchange_meta.update(response_hex=as_hex(rx),
+                                       rx_timestamp=time.time(), rx_monotonic=rx_mono,
+                                       rtt_ms=(rx_mono - begin) * 1000.0)
         validate_frame(rx, self.slave, func)
         self.emit('exchange', tx=as_hex(tx), rx=as_hex(rx))
         return rx
@@ -161,6 +270,8 @@ class LinkWorker(threading.Thread):
                 self.sim_energy = 0.0
                 self.sim_last = now
                 self.sim_t0 = now
+                self.demo_last_tick = -1
+                self.demo_values = (0.0, 0.0, 0.0)
             return
         req = struct.pack('>BBHH', self.slave, 6, address, value)
         rx = self.exchange(req, 6)
@@ -170,34 +281,71 @@ class LinkWorker(threading.Thread):
     def poll(self):
         if self.demo:
             now = time.monotonic()
-            t = now - self.sim_t0
-            # UV lamp appears in repeated exposures, for visual debugging only.
-            active = (t % 19.0) > 3.0 and (t % 19.0) < 14.0
-            power = max(0, 170 + 58 * math.sin(t * 1.6) + 7 * self.random.random()) if active else 0.0
-            interval = max(0, now - self.sim_last)
-            self.sim_last = now
-            self.sim_peak = max(self.sim_peak, power)
-            self.sim_energy += power * interval
-            values = (power, self.sim_peak, self.sim_energy)
-            return values, 'DEMO (not a real Modbus frame)'
+            # The mock device deliberately exposes a 5 Hz register cache.
+            # Polling at 20 Hz will therefore show repeated frames.
+            tick = int((now - self.sim_t0) / DEMO_REFRESH_SECONDS)
+            if tick != self.demo_last_tick:
+                t = tick * DEMO_REFRESH_SECONDS
+                active = 3.0 < (t % 19.0) < 14.0
+                power = max(0.0, 170 + 58 * math.sin(t * 1.6) + 7 * self.random.random()) if active else 0.0
+                interval = max(0.0, (tick - self.demo_last_tick) * DEMO_REFRESH_SECONDS)
+                self.sim_peak = max(self.sim_peak, power)
+                self.sim_energy += power * interval
+                self.demo_values = (power, self.sim_peak, self.sim_energy)
+                self.demo_last_tick = tick
+            # Construct an actual CRC-protected synthetic INT/FLOAT reply.
+            # This is a simulation, not physical LS129 verification.
+            if self.mode == 'FLOAT':
+                payload = struct.pack('>BBBfff', self.slave, 3, 12, *self.demo_values)
+                values = tuple(float(v) for v in struct.unpack('>fff', payload[3:]))
+            else:
+                raw_p = min(65535, max(0, int(self.demo_values[0])))
+                raw_peak = min(65535, max(0, int(self.demo_values[1])))
+                raw_e = min(0xFFFFFFFF, max(0, int(self.demo_values[2])))
+                payload = struct.pack('>BBBHHI', self.slave, 3, 8, raw_p, raw_peak, raw_e)
+                values = float(raw_p), float(raw_peak), float(raw_e)
+            rx = frame(payload)
+            ts = time.time()
+            request = frame(struct.pack('>BBHH', self.slave, 3,
+                                        101 if self.mode == 'FLOAT' else 201,
+                                        6 if self.mode == 'FLOAT' else 4))
+            meta = dict(tx_hex=as_hex(request), response_hex=as_hex(rx),
+                        tx_timestamp=ts, rx_timestamp=ts,
+                        rx_monotonic=now, rtt_ms=0.0)
+            return values, meta
         address, count = ((101, 6) if self.mode == 'FLOAT' else (201, 4))
         req = struct.pack('>BBHH', self.slave, 3, address, count)
         reply = self.exchange(req, 3, count)
-        return parse_measurement(reply, self.slave, self.mode), as_hex(reply)
+        return parse_measurement(reply, self.slave, self.mode), dict(self.last_exchange_meta)
+
+    def sample_once(self, source='periodic'):
+        self.poll_seq += 1
+        seq = self.poll_seq
+        self.last_exchange_meta = {}
+        try:
+            values, meta = self.poll()
+            self.failures = 0
+            self.emit('sample', values=values, poll_seq=seq, source=source, **meta)
+        except Exception as exc:
+            self.failures += 1
+            meta = dict(self.last_exchange_meta)
+            if not meta:
+                meta = dict(tx_hex='', response_hex='', tx_timestamp=time.time(),
+                            rx_timestamp=None, rx_monotonic=None, rtt_ms=None)
+            self.emit('poll_error', poll_seq=seq, source=source,
+                      error=str(exc), **meta)
+            if self.failures in (1, 3) or self.failures % 10 == 0:
+                self.emit('warning', message='讀取失敗 ({})：{}'.format(self.failures, exc))
 
     def handle(self, command):
         name = command[0]
         try:
             if name == 'start':
                 self.write_one(50, 1)  # Reset *device* peak/energy counter.
-                self.emit('started')
+                self.emit('started', timestamp=time.time(), mono=time.monotonic())
             elif name == 'stop':
                 # Capture one last reading, then stop *PC* recording only.
-                try:
-                    values, raw = self.poll()
-                    self.emit('sample', values=values, raw=raw, timestamp=time.time())
-                except Exception as exc:
-                    self.emit('warning', message='Final read failed: {}'.format(exc))
+                self.sample_once(source='final')
                 self.emit('stopped')
             elif name == 'read_smoothing':
                 self.emit('smoothing', value=self.read_one(320))
@@ -225,6 +373,7 @@ class LinkWorker(threading.Thread):
             self.emit('online', demo=self.demo)
             next_poll = time.monotonic()
             while not self.stop_event.is_set():
+                # Control commands are serialized with measurements on this thread.
                 try:
                     command = self.commands.get_nowait()
                     self.handle(command)
@@ -232,16 +381,15 @@ class LinkWorker(threading.Thread):
                     pass
                 now = time.monotonic()
                 if now >= next_poll:
-                    try:
-                        values, raw = self.poll()
-                        self.failures = 0
-                        self.emit('sample', values=values, raw=raw, timestamp=time.time())
-                    except Exception as exc:
-                        self.failures += 1
-                        if self.failures in (1, 3) or self.failures % 10 == 0:
-                            self.emit('warning', message='讀取失敗 ({})：{}'.format(self.failures, exc))
-                    next_poll = time.monotonic() + POLL_SECONDS
-                self.stop_event.wait(0.025)
+                    self.sample_once()
+                    # Schedule by intended start times; do not send a burst
+                    # to 'catch up' if Modbus transactions run too slowly.
+                    next_poll += self.poll_seconds
+                    now = time.monotonic()
+                    if now >= next_poll:
+                        next_poll = now + self.poll_seconds
+                delay = max(0.0, next_poll - time.monotonic())
+                self.stop_event.wait(min(0.005, delay))
         except Exception as exc:
             self.emit('fatal', message=str(exc))
         finally:
@@ -270,6 +418,15 @@ class MonitorApp:
         self.stop_pending = False
         self.start_ts = None
         self.samples = []
+        self.attempts = []
+        self.record_duplicate_count = 0
+        self.record_previous_frame = None
+        self.record_repeat_run = 0
+        self.previous_rx_mono = None
+        self.last_live_frame = None
+        self.live_duplicate_count = 0
+        self.live_repeat_run = 0
+        self.live_rx_times = deque(maxlen=80)
         self.live_samples = deque(maxlen=500)
         self.last_values = (None, None, None)
         self.measurement_id = ''
@@ -284,6 +441,9 @@ class MonitorApp:
         self.id_var = tk.StringVar(value='1')
         self.demo_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value='INT')
+        self.poll_rate_var = tk.StringVar(value='4 Hz')
+        self.poll_info_var = tk.StringVar(value='目標 4 Hz（250 ms）｜實際 -- Hz')
+        self.duplicate_info_var = tk.StringVar(value='重複：0 / 0（0.0%）｜連續相同 0 筆')
         self.probe_var = tk.StringVar(value='未指定')
         self.status_var = tk.StringVar(value='尚未連線')
         self.power_var = tk.StringVar(value='--')
@@ -297,13 +457,71 @@ class MonitorApp:
         self.enable_factor_var = tk.BooleanVar(value=False)
         self.file_var = tk.StringVar(value='尚無記錄')
         self.msg_var = tk.StringVar(value='先選擇串列埠，或使用模擬模式檢查介面。')
+        self._loaded_port = False
+        self._config_path = None
+        self._preferences, self._config_path, pref_error = load_preferences()
+        self._loaded_port = bool(self._preferences.get('com_port'))
+        self.apply_preferences()
+        if pref_error:
+            self.msg_var.set('設定檔讀取失敗，使用預設設定：{}'.format(pref_error))
 
         self.configure_style()
         self.build()
         self.update_units()
         self.refresh_ports()
+        self.bind_preference_events()
         self.root.after(80, self.process_events)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
+
+    def apply_preferences(self):
+        mapping = ((self.port_var, 'com_port'), (self.probe_var, 'probe_type'),
+                   (self.baud_var, 'baud_rate'), (self.id_var, 'slave_id'),
+                   (self.mode_var, 'data_mode'))
+        for variable, key in mapping:
+            if key in self._preferences:
+                variable.set(self._preferences[key])
+        if 'poll_hz' in self._preferences:
+            hz = self._preferences['poll_hz']
+            self.poll_rate_var.set('{} Hz'.format(hz))
+            self.poll_info_var.set('目標 {} Hz（{:.0f} ms）｜實際 -- Hz'.format(hz, 1000.0 / hz))
+
+    def bind_preference_events(self):
+        # Immediate persistence: selection, manual COM text entry, or exit.
+        self.port_box.bind('<<ComboboxSelected>>', self.save_preferences)
+        self.port_box.bind('<FocusOut>', self.save_preferences)
+        self.probe_box.bind('<<ComboboxSelected>>', self.probe_selected)
+        self.baud_box.bind('<<ComboboxSelected>>', self.save_preferences)
+        self.mode_box.bind('<<ComboboxSelected>>', self.save_preferences)
+        self.id_box.bind('<FocusOut>', self.save_preferences)
+
+    def collect_preferences(self):
+        return normalize_preferences({
+            'com_port': self.port_var.get().strip(),
+            'probe_type': self.probe_var.get(),
+            'baud_rate': self.baud_var.get(),
+            'slave_id': self.id_var.get(),
+            'data_mode': self.mode_var.get(),
+            'poll_hz': int(self.poll_rate_var.get().split()[0]),
+        })
+
+    def save_preferences(self, event=None):
+        try:
+            prefs = self.collect_preferences()
+            paths = preference_paths()
+            # Prefer the previously successful location, avoiding divergence
+            # when the portable folder is read-only.
+            if self._config_path in paths:
+                paths = [self._config_path] + [p for p in paths if p != self._config_path]
+            self._config_path = write_preferences(prefs, paths)
+            self._loaded_port = bool(prefs.get('com_port'))
+            return True
+        except (OSError, ValueError) as exc:
+            self.msg_var.set('設定檔儲存失敗：{}'.format(exc))
+            return False
+
+    def probe_selected(self, event=None):
+        self.update_units()
+        self.save_preferences()
 
     def configure_style(self):
         style = ttk.Style()
@@ -332,10 +550,13 @@ class MonitorApp:
         self.tabs.pack(fill='both', expand=True, padx=14, pady=(0, 10))
         self.main = ttk.Frame(self.tabs, padding=12)
         self.settings = ttk.Frame(self.tabs, padding=16)
+        self.lab = ttk.Frame(self.tabs, padding=12)
         self.tabs.add(self.main, text='即時監測 / 量測')
         self.tabs.add(self.settings, text='設備與軟體設定')
+        self.tabs.add(self.lab, text='輪詢實驗 / 逐筆資料')
         self.build_main()
         self.build_settings()
+        self.build_lab()
         self.state_buttons()
         footer = ttk.Frame(self.root, padding=(14, 3, 14, 10))
         footer.pack(fill='x')
@@ -362,13 +583,23 @@ class MonitorApp:
         self.probe_box = ttk.Combobox(connector, textvariable=self.probe_var, state='readonly', width=7,
                                      values=['未指定', 'UVALED', 'UVA', 'UVC'])
         self.probe_box.pack(side='left')
-        self.probe_box.bind('<<ComboboxSelected>>', self.update_units)
+        # Selection handler is bound after widgets are constructed.
         ttk.Label(connector, text='資料').pack(side='left', padx=(10, 3))
         self.mode_box = ttk.Combobox(connector, textvariable=self.mode_var, state='readonly', width=6,
                                     values=['INT', 'FLOAT'])
         self.mode_box.pack(side='left')
         self.link_button = ttk.Button(connector, text='連線', style='Accent.TButton', command=self.toggle_link)
         self.link_button.pack(side='right')
+        ratebar = ttk.Frame(self.main)
+        ratebar.pack(fill='x', pady=(0, 8))
+        ttk.Label(ratebar, text='Modbus 輪詢頻率').pack(side='left')
+        self.poll_box = ttk.Combobox(ratebar, textvariable=self.poll_rate_var,
+                                     state='readonly', values=['4 Hz', '5 Hz', '20 Hz'], width=7)
+        self.poll_box.pack(side='left', padx=(7, 12))
+        self.poll_box.bind('<<ComboboxSelected>>', self.rate_changed)
+        ttk.Label(ratebar, textvariable=self.poll_info_var, style='Caption.TLabel').pack(side='left')
+        ttk.Label(ratebar, text='20 Hz 只提高 PC 輪詢，不保證探頭更新 20 次/秒。',
+                  style='Caption.TLabel').pack(side='right')
 
         metrics = ttk.Frame(self.main)
         metrics.pack(fill='x', pady=(0, 9))
@@ -392,7 +623,7 @@ class MonitorApp:
         bottom.pack(fill='x')
         ttk.Label(bottom, text='測試時間', style='Caption.TLabel').pack(side='left')
         ttk.Label(bottom, textvariable=self.time_var).pack(side='left', padx=(8, 15))
-        ttk.Label(bottom, text='目標輪詢 250 ms；實際時間以電腦收到資料為準', style='Caption.TLabel').pack(side='right')
+        ttk.Label(bottom, text='CSV 記錄每次送出/接收時間及完整封包', style='Caption.TLabel').pack(side='right')
 
         control = ttk.LabelFrame(lower, text='量測控制', padding=10)
         control.grid(row=0, column=1, sticky='nsew')
@@ -401,7 +632,7 @@ class MonitorApp:
         self.stop_button = ttk.Button(control, text='結束並存檔', command=self.stop_measurement)
         self.stop_button.pack(fill='x', pady=(0, 12))
         ttk.Separator(control).pack(fill='x', pady=10)
-        ttk.Label(control, text='讀值格式：INT 201–204\n或 FLOAT 101–106',
+        ttk.Label(control, text='INT 模式只會得到整數(.0)。\nFLOAT 模式有小數（需實機驗證）。\nModbus 輪詢目標可選 4 / 5 / 20 Hz。',
                   style='Caption.TLabel', justify='left').pack(anchor='w', pady=(2, 10))
         ttk.Separator(control).pack(fill='x', pady=9)
         ttk.Label(control, text='平滑模式').pack(anchor='w')
@@ -419,6 +650,8 @@ class MonitorApp:
         ttk.Label(card, textvariable=unit, style='SmallCard.TLabel').pack(pady=(0, 16))
 
     def build_settings(self):
+        ttk.Label(self.settings, text='COM、探頭種類與輪詢設定將自動存入 settings.json；下次啟動會還原。',
+                  style='Caption.TLabel').pack(anchor='w', pady=(0, 8))
         container = ttk.Frame(self.settings)
         container.pack(fill='both', expand=True)
         left = ttk.Frame(container)
@@ -461,6 +694,57 @@ class MonitorApp:
         ttk.Label(right, text='讀取 201–204：2×UINT16 + UINT32。\n讀取 101–106：3×IEEE754 FLOAT。\n量測開始才會寫 Register 50 重新計數。\n結束量測只停止 PC 儲存，不停止探頭。',
                   justify='left', wraplength=340).pack(anchor='w', pady=12)
 
+    def build_lab(self):
+        ttk.Label(self.lab, text='20 Hz 更新率驗證', style='Headline.TLabel').pack(anchor='w')
+        ttk.Label(self.lab, text='比較連續回覆的完整 Modbus HEX：相同代表同一組傳回資料；不同不直接等於探頭 20 Hz 更新。',
+                  style='Caption.TLabel').pack(anchor='w', pady=(5, 12))
+        ttk.Label(self.lab, textvariable=self.poll_info_var).pack(anchor='w')
+        ttk.Label(self.lab, textvariable=self.duplicate_info_var).pack(anchor='w', pady=(6, 10))
+        columns = ('seq', 'elapsed', 'gap', 'power', 'peak', 'energy', 'duplicate', 'run', 'rtt', 'hex')
+        self.lab_table = ttk.Treeview(self.lab, columns=columns, show='headings', height=17)
+        headings = {'seq':'#', 'elapsed':'接收時刻(s)', 'gap':'間距(ms)', 'power':'即時',
+                    'peak':'最大', 'energy':'能量', 'duplicate':'重複?', 'run':'連續',
+                    'rtt':'往返(ms)', 'hex':'Modbus 回覆 HEX'}
+        widths = {'seq':50, 'elapsed':90, 'gap':85, 'power':80, 'peak':80,
+                  'energy':100, 'duplicate':65, 'run':55, 'rtt':80, 'hex':310}
+        for col in columns:
+            self.lab_table.heading(col, text=headings[col])
+            self.lab_table.column(col, width=widths[col], minwidth=35, stretch=(col == 'hex'))
+        bar = ttk.Scrollbar(self.lab, orient='vertical', command=self.lab_table.yview)
+        self.lab_table.configure(yscrollcommand=bar.set)
+        bar.pack(side='right', fill='y')
+        self.lab_table.pack(side='left', fill='both', expand=True)
+
+    def rate_changed(self, event=None):
+        hz = int(self.poll_rate_var.get().split()[0])
+        self.poll_info_var.set('目標 {} Hz（{:.0f} ms）｜實際 -- Hz'.format(hz, 1000.0 / hz))
+        self.msg_var.set('輪詢設定將在下一次連線時套用；20 Hz 需看實際接收頻率。')
+        self.save_preferences()
+
+    def actual_hz(self):
+        if len(self.live_rx_times) < 2:
+            return None
+        span = self.live_rx_times[-1] - self.live_rx_times[0]
+        return (len(self.live_rx_times) - 1) / span if span > 0 else None
+
+    def update_poll_stats(self):
+        hz = int(self.poll_rate_var.get().split()[0])
+        actual = self.actual_hz()
+        self.poll_info_var.set('目標 {} Hz（{:.0f} ms）｜實際 {} Hz'.format(
+            hz, 1000.0 / hz, '{:.2f}'.format(actual) if actual is not None else '--'))
+        n = len(self.samples) if self.recording or self.stop_pending or self.samples else self.log_count
+        dup = self.record_duplicate_count if self.recording or self.stop_pending or self.samples else self.live_duplicate_count
+        run = self.record_repeat_run if self.recording or self.stop_pending or self.samples else self.live_repeat_run
+        self.duplicate_info_var.set('重複：{} / {}（{:.1f}%）｜連續相同 {} 筆'.format(
+            dup, n, (100.0 * dup / max(1, n)), run))
+
+    def append_lab_row(self, values):
+        table = self.lab_table
+        table.insert('', 'end', values=values)
+        if len(table.get_children()) > 300:
+            table.delete(table.get_children()[0])
+        table.yview_moveto(1.0)
+
     def refresh_ports(self):
         ports = []
         try:
@@ -469,8 +753,10 @@ class MonitorApp:
         except ImportError:
             pass
         self.port_box['values'] = ports
-        if ports and self.port_var.get() not in ports:
+        if ports and not self._loaded_port and self.port_var.get() in ('', 'COM3'):
             self.port_var.set(ports[0])
+        elif ports and self._loaded_port and self.port_var.get() not in ports:
+            self.msg_var.set('儲存的 {} 目前未偵測到；請確認 USB-RS485 模組的 COM 號。'.format(self.port_var.get()))
 
     def check_factor(self):
         factor = float(self.factor_var.get())
@@ -511,14 +797,22 @@ class MonitorApp:
             messagebox.showerror('通訊設定不正確', str(exc))
             return
         self.demo = self.demo_var.get()
+        self.live_rx_times.clear()
+        self.live_duplicate_count = 0
+        self.live_repeat_run = 0
+        self.last_live_frame = None
+        self.log_count = 0
+        self.update_poll_stats()
         if not self.demo and not self.port_var.get().strip():
             messagebox.showerror('COM 未選擇', '請選擇 COM Port')
             return
+        self.save_preferences()
         self.commands = queue.Queue()
         self.events = queue.Queue()
         self.stop_event = threading.Event()
         self.worker = LinkWorker(self.commands, self.events, self.stop_event,
-                                 self.port_var.get(), baud, slave, self.mode_var.get(), self.demo)
+                                 self.port_var.get(), baud, slave, self.mode_var.get(), self.demo,
+                                 int(self.poll_rate_var.get().split()[0]))
         self.status_var.set('正在連線...')
         self.worker.start()
         self.state_buttons()
@@ -590,6 +884,7 @@ class MonitorApp:
         state = 'disabled' if online or self.worker is not None else 'normal'
         for widget in (self.port_box, self.baud_box, self.id_box, self.demo_checkbox, self.mode_box):
             widget.config(state=state)
+        self.poll_box.config(state='disabled' if online or self.worker is not None else 'readonly')
         self.probe_box.config(state='disabled' if busy else 'readonly')
         self.factor_entry.config(state='disabled' if busy else 'normal')
         self.factor_checkbox.config(state='disabled' if busy else 'normal')
@@ -612,9 +907,9 @@ class MonitorApp:
             except (ValueError, TypeError):
                 factor = 1.0
         power, peak, energy = self.last_values
-        self.power_var.set(number(power * factor) if power is not None else '--')
-        self.peak_var.set(number(peak * factor) if peak is not None else '--')
-        self.energy_var.set(number(energy * factor) if energy is not None else '--')
+        self.power_var.set(display_number(power * factor) if power is not None else '--')
+        self.peak_var.set(display_number(peak * factor) if peak is not None else '--')
+        self.energy_var.set(display_number(energy * factor) if energy is not None else '--')
 
     def process_events(self):
         try:
@@ -643,10 +938,22 @@ class MonitorApp:
                     self.state_buttons()
                 elif kind == 'sample':
                     self.on_sample(event)
+                elif kind == 'poll_error':
+                    self.on_poll_error(event)
                 elif kind == 'started':
-                    self.start_ts = time.time()
+                    self.start_ts = event['timestamp']
+                    self.start_monotonic = event['mono']
+                    self.previous_rx_mono = None
+                    self.record_previous_frame = None
+                    self.record_repeat_run = 0
+                    self.record_duplicate_count = 0
+                    self.attempts = []
+                    self.live_rx_times.clear()
+                    for row_id in self.lab_table.get_children():
+                        self.lab_table.delete(row_id)
                     self.measurement_id = dt.datetime.now().strftime('LS129_%Y%m%d_%H%M%S')
                     self.samples = []
+                    self.update_poll_stats()
                     self.start_pending = False
                     self.stop_pending = False
                     self.recording = True
@@ -693,12 +1000,61 @@ class MonitorApp:
     def on_sample(self, event):
         power, peak, energy = event['values']
         self.last_values = (power, peak, energy)
+        self.log_count += 1
+        mono = event['rx_monotonic']
+        self.live_rx_times.append(mono)
+        raw = event['response_hex']
+        live_same = duplicate_frame(self.last_live_frame, raw)
+        self.live_duplicate_count += int(live_same)
+        self.live_repeat_run = self.live_repeat_run + 1 if live_same else 1
+        self.last_live_frame = raw
         if self.recording:
-            row = {'ts': event['timestamp'], 'elapsed': max(0, event['timestamp'] - self.start_ts),
-                   'power': power, 'peak': peak, 'energy': energy, 'raw': event['raw']}
+            prev_same = duplicate_frame(self.record_previous_frame, raw)
+            self.record_duplicate_count += int(prev_same)
+            self.record_repeat_run = self.record_repeat_run + 1 if prev_same else 1
+            self.record_previous_frame = raw
+            gap_ms = (mono - self.previous_rx_mono) * 1000.0 if self.previous_rx_mono is not None else None
+            self.previous_rx_mono = mono
+            row = {'status':'OK', 'error':'', 'poll_seq':event['poll_seq'], 'index':len(self.attempts)+1,
+                   'ts':event['rx_timestamp'], 'tx_ts':event['tx_timestamp'],
+                   'elapsed':max(0, mono - self.start_monotonic),
+                   'rx_gap_ms':gap_ms, 'rtt_ms':event['rtt_ms'],
+                   'power':power, 'peak':peak, 'energy':energy,
+                   'raw':raw, 'tx_hex':event['tx_hex'],
+                   'duplicate':prev_same, 'run_length':self.record_repeat_run,
+                   'source':event['source']}
             self.samples.append(row)
-        self.live_samples.append((event['timestamp'], power))
+            self.attempts.append(row)
+            self.append_lab_row((row['index'], '{:.3f}'.format(row['elapsed']),
+                                 '{:.1f}'.format(gap_ms) if gap_ms is not None else '--',
+                                 '{:.3f}'.format(power), '{:.3f}'.format(peak), '{:.3f}'.format(energy),
+                                 'YES' if prev_same else '', row['run_length'],
+                                 '{:.1f}'.format(row['rtt_ms']) if row['rtt_ms'] is not None else '--', raw))
+        self.live_samples.append((event['rx_timestamp'], power))
         self.update_display()
+        self.update_poll_stats()
+
+    def on_poll_error(self, event):
+        # Failed exchanges also get an audit row. A dropped frame breaks
+        # a consecutive-duplicate run rather than bridging over unknown data.
+        self.record_previous_frame = None
+        self.record_repeat_run = 0
+        self.last_live_frame = None
+        self.live_repeat_run = 0
+        if not self.recording:
+            return
+        ts = event['rx_timestamp'] if event['rx_timestamp'] is not None else time.time()
+        row = {'status':'ERROR', 'error':event['error'], 'poll_seq':event['poll_seq'],
+               'index':len(self.attempts)+1, 'ts':ts,
+               'tx_ts':event['tx_timestamp'], 'elapsed':max(0, time.monotonic()-self.start_monotonic),
+               'rx_gap_ms':None, 'rtt_ms':event['rtt_ms'], 'power':None,
+               'peak':None, 'energy':None, 'raw':event['response_hex'],
+               'tx_hex':event['tx_hex'], 'duplicate':False, 'run_length':0,
+               'source':event['source']}
+        self.attempts.append(row)
+        self.append_lab_row((row['index'], '{:.3f}'.format(row['elapsed']), '--', '--', '--', '--',
+                             'ERROR', '0', '--', event['response_hex'] or event['error']))
+        self.update_poll_stats()
 
     def draw_graph(self):
         canvas = self.plot
@@ -742,8 +1098,8 @@ class MonitorApp:
         canvas.create_text(l + 8, t + 8, anchor='nw', text='Raw LS129 (未修正)', fill='#087bad', font=('Arial', 10))
 
     def save_record(self, reason):
-        if not self.samples:
-            self.msg_var.set('未取得有效樣本，沒有建立檔案。')
+        if not self.attempts:
+            self.msg_var.set('未進行有效輪詢，沒有建立檔案。')
             return
         folder = os.path.join(APP_DIR, 'Records')
         try:
@@ -755,26 +1111,45 @@ class MonitorApp:
                 os.makedirs(folder)
         path = os.path.join(folder, self.measurement_id + '.csv')
         power_unit, energy_unit = unit_labels(self.probe_var.get())
-        columns = ['measurement_id', 'timestamp', 'elapsed_s', 'power_raw', 'peak_raw', 'energy_raw',
+        columns = ['measurement_id', 'poll_sequence', 'attempt_index', 'status', 'error', 'source',
+                   'send_timestamp', 'receive_timestamp', 'elapsed_s', 'rx_gap_ms', 'round_trip_ms',
+                   'target_poll_hz', 'duplicate_previous', 'consecutive_run',
+                   'power_raw', 'peak_raw', 'energy_raw',
                    'power_pc', 'peak_pc', 'energy_pc', 'pc_factor', 'power_unit', 'energy_unit',
-                   'probe_type', 'data_mode', 'slave_id', 'baud_rate', 'smoothing', 'end_reason', 'response_hex']
+                   'probe_type', 'data_mode', 'slave_id', 'baud_rate', 'smoothing', 'end_reason',
+                   'request_hex', 'response_hex']
         try:
             with open(path, 'w', newline='', encoding='utf-8-sig') as handle:
                 writer = csv.DictWriter(handle, fieldnames=columns)
                 writer.writeheader()
-                for sample in self.samples:
-                    ts = dt.datetime.fromtimestamp(sample['ts']).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                for sample in self.attempts:
+                    def stamp(value):
+                        return dt.datetime.fromtimestamp(value).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if value is not None else ''
                     factor = self.record_factor
-                    writer.writerow(dict(measurement_id=self.measurement_id, timestamp=ts,
-                        elapsed_s='{:.3f}'.format(sample['elapsed']), power_raw=sample['power'],
-                        peak_raw=sample['peak'], energy_raw=sample['energy'],
-                        power_pc=sample['power'] * factor, peak_pc=sample['peak'] * factor,
-                        energy_pc=sample['energy'] * factor, pc_factor=factor,
+                    success = sample['status'] == 'OK'
+                    writer.writerow(dict(measurement_id=self.measurement_id,
+                        poll_sequence=sample['poll_seq'], attempt_index=sample['index'],
+                        status=sample['status'], error=sample['error'], source=sample['source'],
+                        send_timestamp=stamp(sample['tx_ts']), receive_timestamp=stamp(sample['ts']),
+                        elapsed_s='{:.6f}'.format(sample['elapsed']),
+                        rx_gap_ms='{:.3f}'.format(sample['rx_gap_ms']) if sample['rx_gap_ms'] is not None else '',
+                        round_trip_ms='{:.3f}'.format(sample['rtt_ms']) if sample['rtt_ms'] is not None else '',
+                        target_poll_hz=int(self.poll_rate_var.get().split()[0]),
+                        duplicate_previous='1' if sample['duplicate'] else '0' if success else '',
+                        consecutive_run=sample['run_length'] if success else '',
+                        power_raw=sample['power'] if success else '',
+                        peak_raw=sample['peak'] if success else '',
+                        energy_raw=sample['energy'] if success else '',
+                        power_pc=sample['power'] * factor if success else '',
+                        peak_pc=sample['peak'] * factor if success else '',
+                        energy_pc=sample['energy'] * factor if success else '', pc_factor=factor,
                         power_unit=power_unit, energy_unit=energy_unit, probe_type=self.probe_var.get(),
                         data_mode=self.mode_var.get(), slave_id=self.id_var.get(), baud_rate=self.baud_var.get(),
-                        smoothing=self.smooth_var.get(), end_reason=reason, response_hex=sample['raw']))
+                        smoothing=self.smooth_var.get(), end_reason=reason,
+                        request_hex=sample['tx_hex'], response_hex=sample['raw']))
             self.file_var.set(path)
-            self.msg_var.set('已儲存 {} 筆資料：{}'.format(len(self.samples), path))
+            self.msg_var.set('已儲存 {} 筆成功、{} 筆失敗：{}'.format(
+                len(self.samples), len(self.attempts)-len(self.samples), path))
         except Exception as exc:
             self.msg_var.set('無法儲存：{}'.format(exc))
             messagebox.showerror('存檔失敗', str(exc))
@@ -785,6 +1160,7 @@ class MonitorApp:
                 return
             self.recording = False
             self.save_record('程式關閉')
+        self.save_preferences()
         if self.stop_event:
             self.stop_event.set()
         self.root.destroy()
@@ -801,7 +1177,20 @@ def self_test():
     f1, f2, f3 = parse_measurement(rx3, 1, 'FLOAT')
     assert abs(f1 - 36.625) < 0.1 and abs(f2 - 42.814) < 0.1 and abs(f3 - 133.91) < 0.1
     assert as_hex(frame(bytes.fromhex('01 06 00 32 00 01'))) == '01 06 00 32 00 01 E9 C5'
-    print('SELF TEST OK: CRC16, INT/FLOAT decode, register 320, recount command')
+    assert display_number(21.267) == '21.3' and display_number(21) == '21.0'
+    assert display_number(1.25) == '1.3' and display_number(-1.25) == '-1.3'
+    assert [fixed_poll_interval(hz) for hz in POLL_RATES] == [0.25, 0.2, 0.05]
+    assert duplicate_frame('AB', 'AB') and not duplicate_frame('AB', 'AC')
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        cfg = os.path.join(folder, PREF_FILENAME)
+        values = {'com_port':'COM9', 'probe_type':'UVALED', 'baud_rate':'9600',
+                  'slave_id':'1', 'data_mode':'FLOAT', 'poll_hz':20}
+        assert write_preferences(values, [cfg]) == cfg
+        restored, file_path, error = load_preferences([cfg])
+        assert restored == values and file_path == cfg and error is None
+        assert not normalize_preferences({'poll_hz':999, 'probe_type':'invalid', 'slave_id':999})
+    print('SELF TEST OK: CRC16, INT/FLOAT, rounding, 4/5/20 Hz, duplicate detection, config read/write')
 
 
 if __name__ == '__main__':
