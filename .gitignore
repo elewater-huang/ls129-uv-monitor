@@ -1,0 +1,10 @@
+# Generated / local data
+__pycache__/
+*.py[cod]
+Records/
+*.csv
+.venv/
+venv/
+.vscode/
+.idea/
+*.log
