@@ -1,0 +1,10 @@
+{
+  "baud_rate": "9600",
+  "com_port": "COM5",
+  "data_mode": "INT",
+  "language": "zh-TW",
+  "poll_hz": 0.2,
+  "probe_type": "UVALED",
+  "slave_id": "1",
+  "smoothing_mode": 2
+}

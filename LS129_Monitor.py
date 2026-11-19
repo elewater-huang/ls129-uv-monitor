@@ -21,15 +21,17 @@ import threading
 import time
 from collections import deque
 
+from ls129_i18n import translate, LANGUAGE_LABELS
+
 try:
     import tkinter as tk
     from tkinter import ttk, messagebox
 except ImportError:
     raise SystemExit('tkinter is required. Install a Python distribution with Tcl/Tk.')
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-POLL_RATES = (4, 5, 20)  # PC query targets, NOT the LS129 internal sample rate.
+MAX_POLL_HZ = 32.0  # PC query rate, independent of probe ADC and register updates.
 DEMO_REFRESH_SECONDS = 0.20  # Simulate one sensor update every 200 ms.
 PREF_FILENAME = 'settings.json'  # Local application settings, never written to LS129.
 
@@ -104,10 +106,23 @@ def display_number(value):
     return '{:,.1f}'.format(v)
 
 
+def parse_poll_hz(value):
+    """Accept positive decimal Hz (e.g. 0.2, 4, 31.5, 32); reject 0/inf/NaN."""
+    try:
+        hz = float(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('輪詢頻率須大於 0 且不超過 32 Hz。')
+    if not (math.isfinite(hz) and 0 < hz <= MAX_POLL_HZ):
+        raise ValueError('輪詢頻率須大於 0 且不超過 32 Hz。')
+    return hz
+
+
+def format_hz(hz):
+    return '{:g}'.format(float(hz))
+
+
 def fixed_poll_interval(hz):
-    if hz not in POLL_RATES:
-        raise ValueError('輪詢頻率只支援 4、5 或 20 Hz')
-    return 1.0 / float(hz)
+    return 1.0 / parse_poll_hz(hz)
 
 
 def duplicate_frame(previous, current):
@@ -150,9 +165,18 @@ def normalize_preferences(data):
         pass
     if data.get('data_mode') in ('INT', 'FLOAT'):
         out['data_mode'] = data['data_mode']
-    rate = str(data.get('poll_hz', ''))
-    if rate in ('4', '5', '20'):
-        out['poll_hz'] = int(rate)
+    try:
+        out['poll_hz'] = parse_poll_hz(data.get('poll_hz'))
+    except ValueError:
+        pass
+    try:
+        sm = int(data.get('smoothing_mode'))
+        if sm in (0, 1, 2):
+            out['smoothing_mode'] = sm
+    except (ValueError, TypeError):
+        pass
+    if data.get('language') in LANGUAGE_LABELS:
+        out['language'] = data['language']
     return out
 
 
@@ -441,7 +465,9 @@ class MonitorApp:
         self.id_var = tk.StringVar(value='1')
         self.demo_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value='INT')
-        self.poll_rate_var = tk.StringVar(value='4 Hz')
+        self.poll_rate_var = tk.StringVar(value='4')
+        self._last_valid_hz = 4.0
+        self.poll_hz_live = 4.0
         self.poll_info_var = tk.StringVar(value='目標 4 Hz（250 ms）｜實際 -- Hz')
         self.duplicate_info_var = tk.StringVar(value='重複：0 / 0（0.0%）｜連續相同 0 筆')
         self.probe_var = tk.StringVar(value='未指定')
@@ -461,16 +487,22 @@ class MonitorApp:
         self._config_path = None
         self._preferences, self._config_path, pref_error = load_preferences()
         self._loaded_port = bool(self._preferences.get('com_port'))
+        self.language_code = self._preferences.get('language', 'zh-TW')
+        self.language_var = tk.StringVar(value=LANGUAGE_LABELS[self.language_code])
+        self.selected_smoothing = int(self._preferences.get('smoothing_mode', 0))
         self.apply_preferences()
         if pref_error:
-            self.msg_var.set('設定檔讀取失敗，使用預設設定：{}'.format(pref_error))
+            self.msg_var.set(self.tr('設定檔讀取失敗，使用預設設定：{}').format(pref_error))
 
         self.configure_style()
         self.build()
+        self.capture_i18n_widgets()
+        self.localize_widgets()
         self.update_units()
+        self.update_poll_stats()
         self.refresh_ports()
         self.bind_preference_events()
-        self.root.after(80, self.process_events)
+        self._process_after_id = self.root.after(80, self.process_events)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
 
     def apply_preferences(self):
@@ -482,8 +514,9 @@ class MonitorApp:
                 variable.set(self._preferences[key])
         if 'poll_hz' in self._preferences:
             hz = self._preferences['poll_hz']
-            self.poll_rate_var.set('{} Hz'.format(hz))
-            self.poll_info_var.set('目標 {} Hz（{:.0f} ms）｜實際 -- Hz'.format(hz, 1000.0 / hz))
+            self.poll_rate_var.set(format_hz(hz))
+            self._last_valid_hz = hz
+            self.poll_info_var.set(self.tr('目標 {} Hz（{:.0f} ms）｜實際 -- Hz').format(format_hz(hz), 1000.0 / hz))
 
     def bind_preference_events(self):
         # Immediate persistence: selection, manual COM text entry, or exit.
@@ -493,15 +526,20 @@ class MonitorApp:
         self.baud_box.bind('<<ComboboxSelected>>', self.save_preferences)
         self.mode_box.bind('<<ComboboxSelected>>', self.save_preferences)
         self.id_box.bind('<FocusOut>', self.save_preferences)
+        self.poll_box.bind('<FocusOut>', self.rate_changed)
+        self.poll_box.bind('<Return>', self.rate_changed)
+        self.smooth_box.bind('<<ComboboxSelected>>', self.smoothing_preference_changed)
 
     def collect_preferences(self):
         return normalize_preferences({
             'com_port': self.port_var.get().strip(),
-            'probe_type': self.probe_var.get(),
+            'probe_type': self.probe_id(),
             'baud_rate': self.baud_var.get(),
             'slave_id': self.id_var.get(),
             'data_mode': self.mode_var.get(),
-            'poll_hz': int(self.poll_rate_var.get().split()[0]),
+            'poll_hz': self._last_valid_hz,
+            'smoothing_mode': int(self.smooth_choice.get().split(' ')[0]),
+            'language': self.language_code,
         })
 
     def save_preferences(self, event=None):
@@ -516,12 +554,92 @@ class MonitorApp:
             self._loaded_port = bool(prefs.get('com_port'))
             return True
         except (OSError, ValueError) as exc:
-            self.msg_var.set('設定檔儲存失敗：{}'.format(exc))
+            self.msg_var.set(self.tr('設定檔儲存失敗：{}').format(exc))
             return False
+
+    def probe_id(self):
+        value = self.probe_var.get()
+        if value in (translate('未指定', 'zh-CN'), translate('未指定', 'en')):
+            return '未指定'
+        return value
 
     def probe_selected(self, event=None):
         self.update_units()
         self.save_preferences()
+
+    def tr(self, text):
+        return translate(text, self.language_code)
+
+    def capture_i18n_widgets(self):
+        """Capture original traditional-Chinese strings before first translation."""
+        self._i18n_widgets = []
+        def visit(parent):
+            for widget in parent.winfo_children():
+                try:
+                    original = widget.cget('text')
+                    if original:
+                        self._i18n_widgets.append((widget, original))
+                except (tk.TclError, AttributeError):
+                    pass
+                visit(widget)
+        visit(self.root)
+        self._i18n_tabs = [self.tabs.tab(i, 'text') for i in range(self.tabs.index('end'))]
+        self._i18n_headers = {key:self.lab_table.heading(key, 'text') for key in self.lab_table['columns']}
+
+    def localize_widgets(self):
+        for widget, original in self._i18n_widgets:
+            try:
+                widget.configure(text=self.tr(original))
+            except tk.TclError:
+                pass
+        for idx, original in enumerate(self._i18n_tabs):
+            self.tabs.tab(idx, text=self.tr(original))
+        for key, original in self._i18n_headers.items():
+            self.lab_table.heading(key, text=self.tr(original))
+        probe = self.probe_id()
+        self.probe_box.configure(values=[self.tr('未指定'), 'UVALED', 'UVA', 'UVC'])
+        self.probe_var.set(self.tr('未指定') if probe == '未指定' else probe)
+        sm = int(self.smooth_choice.get().split(' ')[0])
+        self.smooth_box.configure(values=self.smoothing_options())
+        self.smooth_choice.set(self.smoothing_options()[sm])
+        self.state_buttons()
+        self.update_poll_stats()
+        if self.smooth_var.get() in ('讀取中 / 未讀取', translate('讀取中 / 未讀取', 'en'),
+                                      translate('讀取中 / 未讀取', 'zh-CN')):
+            self.smooth_var.set(self.tr('讀取中 / 未讀取'))
+        if self.file_var.get() in ('尚無記錄', translate('尚無記錄','en'),
+                                   translate('尚無記錄','zh-CN')):
+            self.file_var.set(self.tr('尚無記錄'))
+        if not self.connected and not self.worker:
+            self.status_var.set(self.tr('尚未連線'))
+            if self.msg_var.get() in ('先選擇串列埠，或使用模擬模式檢查介面。',
+                                      translate('先選擇串列埠，或使用模擬模式檢查介面。','en'),
+                                      translate('先選擇串列埠，或使用模擬模式檢查介面。','zh-CN')):
+                self.msg_var.set(self.tr('先選擇串列埠，或使用模擬模式檢查介面。'))
+
+    def smoothing_options(self):
+        return [self.tr('0 - 不平滑 / DC'), '1 - 50 Hz', '2 - 60 Hz']
+
+    def smoothing_preference_changed(self, event=None):
+        self.selected_smoothing = int(self.smooth_choice.get().split(' ')[0])
+        self.save_preferences()
+        self.msg_var.set(self.tr('平滑模式設定已保存，尚未寫入 LS129。'))
+
+    def language_changed(self, event=None):
+        lookup = {label:code for code,label in LANGUAGE_LABELS.items()}
+        new_code = lookup.get(self.language_var.get(), 'zh-TW')
+        if new_code == self.language_code:
+            return
+        self.language_code = new_code
+        self.localize_widgets()
+        if not self.connected:
+            self.status_var.set(self.tr('尚未連線'))
+        elif self.demo:
+            self.status_var.set(self.tr('模擬連線'))
+        else:
+            self.status_var.set(self.tr('已連線：{} / {}').format(self.port_var.get(), self.baud_var.get()))
+        self.save_preferences()
+        self.msg_var.set(self.tr('資料記錄語言為 {}').format(self.language_var.get()))
 
     def configure_style(self):
         style = ttk.Style()
@@ -546,6 +664,11 @@ class MonitorApp:
         ttk.Label(top, text='LS129 UV Monitor', style='Headline.TLabel').pack(side='left')
         ttk.Label(top, text='  v{} | Modbus RTU / RS485'.format(VERSION), style='Caption.TLabel').pack(side='left', pady=8)
         ttk.Label(top, textvariable=self.status_var).pack(side='right')
+        self.language_box = ttk.Combobox(top, textvariable=self.language_var, state='readonly',
+                                          width=14, values=list(LANGUAGE_LABELS.values()))
+        self.language_box.pack(side='right', padx=(6, 22))
+        self.language_box.bind('<<ComboboxSelected>>', self.language_changed)
+        ttk.Label(top, text='語言').pack(side='right')
         self.tabs = ttk.Notebook(self.root)
         self.tabs.pack(fill='both', expand=True, padx=14, pady=(0, 10))
         self.main = ttk.Frame(self.tabs, padding=12)
@@ -593,12 +716,11 @@ class MonitorApp:
         ratebar = ttk.Frame(self.main)
         ratebar.pack(fill='x', pady=(0, 8))
         ttk.Label(ratebar, text='Modbus 輪詢頻率').pack(side='left')
-        self.poll_box = ttk.Combobox(ratebar, textvariable=self.poll_rate_var,
-                                     state='readonly', values=['4 Hz', '5 Hz', '20 Hz'], width=7)
-        self.poll_box.pack(side='left', padx=(7, 12))
-        self.poll_box.bind('<<ComboboxSelected>>', self.rate_changed)
+        self.poll_box = ttk.Entry(ratebar, textvariable=self.poll_rate_var, width=8)
+        self.poll_box.pack(side='left', padx=(7, 4))
+        ttk.Label(ratebar, text='Hz').pack(side='left', padx=(0, 8))
         ttk.Label(ratebar, textvariable=self.poll_info_var, style='Caption.TLabel').pack(side='left')
-        ttk.Label(ratebar, text='20 Hz 只提高 PC 輪詢，不保證探頭更新 20 次/秒。',
+        ttk.Label(ratebar, text='電腦輪詢頻率：輸入大於 0、最多 32 Hz（允許小數）',
                   style='Caption.TLabel').pack(side='right')
 
         metrics = ttk.Frame(self.main)
@@ -663,9 +785,9 @@ class MonitorApp:
         ttk.Label(group, text='通訊參數由主畫面指定；目前不提供修改探頭站號和 Baud Rate。',
                   wraplength=360).pack(anchor='w', pady=(0, 15))
         ttk.Label(group, text='光源頻率平滑模式（Register 320）').pack(anchor='w')
-        self.smooth_choice = tk.StringVar(value='0 - 不平滑 / DC')
+        self.smooth_choice = tk.StringVar(value=['0 - 不平滑 / DC', '1 - 50 Hz', '2 - 60 Hz'][self.selected_smoothing])
         self.smooth_box = ttk.Combobox(group, textvariable=self.smooth_choice, state='readonly',
-                          values=['0 - 不平滑 / DC', '1 - 50 Hz', '2 - 60 Hz'])
+                          values=self.smoothing_options())
         self.smooth_box.pack(fill='x', pady=(6, 8))
         smooth_buttons = ttk.Frame(group)
         smooth_buttons.pack(fill='x')
@@ -695,8 +817,8 @@ class MonitorApp:
                   justify='left', wraplength=340).pack(anchor='w', pady=12)
 
     def build_lab(self):
-        ttk.Label(self.lab, text='20 Hz 更新率驗證', style='Headline.TLabel').pack(anchor='w')
-        ttk.Label(self.lab, text='比較連續回覆的完整 Modbus HEX：相同代表同一組傳回資料；不同不直接等於探頭 20 Hz 更新。',
+        ttk.Label(self.lab, text='輪詢頻率實驗（0–32 Hz）', style='Headline.TLabel').pack(anchor='w')
+        ttk.Label(self.lab, text='比較完整 Modbus HEX 與接收時間戳；不同數值不必然代表探頭具有相同的有效頻寬。',
                   style='Caption.TLabel').pack(anchor='w', pady=(5, 12))
         ttk.Label(self.lab, textvariable=self.poll_info_var).pack(anchor='w')
         ttk.Label(self.lab, textvariable=self.duplicate_info_var).pack(anchor='w', pady=(6, 10))
@@ -716,10 +838,19 @@ class MonitorApp:
         self.lab_table.pack(side='left', fill='both', expand=True)
 
     def rate_changed(self, event=None):
-        hz = int(self.poll_rate_var.get().split()[0])
-        self.poll_info_var.set('目標 {} Hz（{:.0f} ms）｜實際 -- Hz'.format(hz, 1000.0 / hz))
-        self.msg_var.set('輪詢設定將在下一次連線時套用；20 Hz 需看實際接收頻率。')
+        try:
+            hz = parse_poll_hz(self.poll_rate_var.get())
+        except ValueError as exc:
+            self.poll_rate_var.set(format_hz(self._last_valid_hz))
+            self.msg_var.set(self.tr(str(exc)))
+            messagebox.showerror(self.tr('輪詢頻率設定錯誤'), self.tr(str(exc)))
+            return False
+        self._last_valid_hz = hz
+        self.poll_rate_var.set(format_hz(hz))
+        self.update_poll_stats()
+        self.msg_var.set(self.tr('設定已更新，下一次連線時套用。'))
         self.save_preferences()
+        return True
 
     def actual_hz(self):
         if len(self.live_rx_times) < 2:
@@ -728,14 +859,14 @@ class MonitorApp:
         return (len(self.live_rx_times) - 1) / span if span > 0 else None
 
     def update_poll_stats(self):
-        hz = int(self.poll_rate_var.get().split()[0])
+        hz = self._last_valid_hz
         actual = self.actual_hz()
-        self.poll_info_var.set('目標 {} Hz（{:.0f} ms）｜實際 {} Hz'.format(
-            hz, 1000.0 / hz, '{:.2f}'.format(actual) if actual is not None else '--'))
+        self.poll_info_var.set(self.tr('目標 {} Hz（{:.0f} ms）｜實際 {} Hz').format(
+            format_hz(hz), 1000.0 / hz, '{:.2f}'.format(actual) if actual is not None else '--'))
         n = len(self.samples) if self.recording or self.stop_pending or self.samples else self.log_count
         dup = self.record_duplicate_count if self.recording or self.stop_pending or self.samples else self.live_duplicate_count
         run = self.record_repeat_run if self.recording or self.stop_pending or self.samples else self.live_repeat_run
-        self.duplicate_info_var.set('重複：{} / {}（{:.1f}%）｜連續相同 {} 筆'.format(
+        self.duplicate_info_var.set(self.tr('重複：{} / {}（{:.1f}%）｜連續相同 {} 筆').format(
             dup, n, (100.0 * dup / max(1, n)), run))
 
     def append_lab_row(self, values):
@@ -756,7 +887,7 @@ class MonitorApp:
         if ports and not self._loaded_port and self.port_var.get() in ('', 'COM3'):
             self.port_var.set(ports[0])
         elif ports and self._loaded_port and self.port_var.get() not in ports:
-            self.msg_var.set('儲存的 {} 目前未偵測到；請確認 USB-RS485 模組的 COM 號。'.format(self.port_var.get()))
+            self.msg_var.set(self.tr('儲存的 {} 目前未偵測到；請確認 USB-RS485 模組的 COM 號。').format(self.port_var.get()))
 
     def check_factor(self):
         factor = float(self.factor_var.get())
@@ -770,15 +901,15 @@ class MonitorApp:
     def factor_changed(self):
         if self.recording or self.start_pending or self.stop_pending:
             self.enable_factor_var.set(self.record_factor != 1.0)
-            self.msg_var.set('量測期間不能修改修正參數，請結束量測後再設定。')
+            self.msg_var.set(self.tr('量測期間不能修改修正參數，請結束量測後再設定。'))
             return
         try:
             factor = self.get_active_factor()
         except (ValueError, TypeError) as exc:
-            messagebox.showerror('修正倍率不正確', str(exc))
+            messagebox.showerror(self.tr('修正倍率不正確'), self.tr(str(exc)))
             self.enable_factor_var.set(False)
             return
-        self.msg_var.set('目前 PC 軟體修正 K = {:.4f}；未寫入探頭。'.format(factor))
+        self.msg_var.set(self.tr('目前 PC 軟體修正 K = {:.4f}；未寫入探頭。').format(factor))
         self.update_display()
 
     def toggle_link(self):
@@ -793,9 +924,12 @@ class MonitorApp:
             if not 1 <= slave <= 247:
                 raise ValueError('站號須介於 1～247')
             baud = int(self.baud_var.get())
+            requested_hz = parse_poll_hz(self.poll_rate_var.get())
         except ValueError as exc:
-            messagebox.showerror('通訊設定不正確', str(exc))
+            messagebox.showerror(self.tr('通訊設定不正確'), self.tr(str(exc)))
             return
+        self._last_valid_hz = requested_hz
+        self.poll_rate_var.set(format_hz(requested_hz))
         self.demo = self.demo_var.get()
         self.live_rx_times.clear()
         self.live_duplicate_count = 0
@@ -804,7 +938,7 @@ class MonitorApp:
         self.log_count = 0
         self.update_poll_stats()
         if not self.demo and not self.port_var.get().strip():
-            messagebox.showerror('COM 未選擇', '請選擇 COM Port')
+            messagebox.showerror(self.tr('COM 未選擇'), self.tr('請選擇 COM Port'))
             return
         self.save_preferences()
         self.commands = queue.Queue()
@@ -812,14 +946,15 @@ class MonitorApp:
         self.stop_event = threading.Event()
         self.worker = LinkWorker(self.commands, self.events, self.stop_event,
                                  self.port_var.get(), baud, slave, self.mode_var.get(), self.demo,
-                                 int(self.poll_rate_var.get().split()[0]))
-        self.status_var.set('正在連線...')
+                                 requested_hz)
+        self.poll_hz_live = requested_hz
+        self.status_var.set(self.tr('正在連線...'))
         self.worker.start()
         self.state_buttons()
 
     def disconnect(self):
         if self.recording or self.stop_pending or self.start_pending:
-            messagebox.showwarning('請先結束量測', '請先按「結束並存檔」，再斷線。')
+            messagebox.showwarning(self.tr('請先結束量測'), self.tr('請先按「結束並存檔」，再斷線。'))
             return
         self.disconnect_force()
 
@@ -829,7 +964,7 @@ class MonitorApp:
         self.connected = False
         self.worker = None
         self.stop_event = None
-        self.status_var.set('尚未連線')
+        self.status_var.set(self.tr('尚未連線'))
         self.state_buttons()
 
     def start_measurement(self):
@@ -838,16 +973,16 @@ class MonitorApp:
         try:
             factor = self.get_active_factor()
         except (TypeError, ValueError) as exc:
-            messagebox.showerror('設定錯誤', str(exc))
+            messagebox.showerror(self.tr('設定錯誤'), str(exc))
             return
-        if self.probe_var.get() == '未指定':
-            if not messagebox.askyesno('探頭未指定', '未選擇 UVA/UVALED/UVC，資料單位將記為未指定。繼續嗎？'):
+        if self.probe_id() == '未指定':
+            if not messagebox.askyesno(self.tr('探頭未指定'), self.tr('未選擇 UVA/UVALED/UVC，資料單位將記為未指定。繼續嗎？')):
                 return
         self.record_factor = factor
         self.start_pending = True
         self.recording = False
         self.commands.put(('start',))
-        self.msg_var.set('正在重設 LS129 的最大功率及累積能量計數...')
+        self.msg_var.set(self.tr('正在重設 LS129 的最大功率及累積能量計數...'))
         self.state_buttons()
 
     def stop_measurement(self):
@@ -855,36 +990,37 @@ class MonitorApp:
             return
         self.stop_pending = True
         self.commands.put(('stop',))
-        self.msg_var.set('正在取得最後讀值...')
+        self.msg_var.set(self.tr('正在取得最後讀值...'))
         self.state_buttons()
 
     def read_smoothing(self):
         if self.connected:
             self.commands.put(('read_smoothing',))
         else:
-            messagebox.showwarning('尚未連線', '請先連線。')
+            messagebox.showwarning(self.tr('尚未連線'), self.tr('請先連線。'))
 
     def write_smoothing(self):
         if not self.connected:
-            messagebox.showwarning('尚未連線', '請先連線。')
+            messagebox.showwarning(self.tr('尚未連線'), self.tr('請先連線。'))
             return
         if self.recording or self.start_pending or self.stop_pending:
-            messagebox.showwarning('量測進行中', '量測期間不可修改平滑設定。')
+            messagebox.showwarning(self.tr('量測進行中'), self.tr('量測期間不可修改平滑設定。'))
             return
         value = int(self.smooth_choice.get().split(' ')[0])
-        if messagebox.askyesno('確認寫入 LS129', '確定將探頭的平滑模式改為 {}？\n寫入後將再讀回驗證。'.format(self.smooth_choice.get())):
+        self.save_preferences()
+        if messagebox.askyesno(self.tr('確認寫入 LS129'), self.tr('確定將探頭的平滑模式改為 {}？\n寫入後將再讀回驗證。').format(self.smooth_choice.get())):
             self.commands.put(('write_smoothing', value))
 
     def state_buttons(self):
         online = self.connected
-        self.link_button.config(text='斷線' if online else '連線')
+        self.link_button.config(text=self.tr('斷線') if online else self.tr('連線'))
         self.start_button.config(state='normal' if online and not self.recording and not self.start_pending else 'disabled')
         self.stop_button.config(state='normal' if self.recording and not self.stop_pending else 'disabled')
         busy = self.recording or self.start_pending or self.stop_pending
         state = 'disabled' if online or self.worker is not None else 'normal'
         for widget in (self.port_box, self.baud_box, self.id_box, self.demo_checkbox, self.mode_box):
             widget.config(state=state)
-        self.poll_box.config(state='disabled' if online or self.worker is not None else 'readonly')
+        self.poll_box.config(state='disabled' if online or self.worker is not None else 'normal')
         self.probe_box.config(state='disabled' if busy else 'readonly')
         self.factor_entry.config(state='disabled' if busy else 'normal')
         self.factor_checkbox.config(state='disabled' if busy else 'normal')
@@ -893,9 +1029,9 @@ class MonitorApp:
         self.read_smooth_button.config(state='disabled' if not online else 'normal')
 
     def update_units(self, event=None):
-        pu, eu = unit_labels(self.probe_var.get())
-        self.power_unit_var.set(pu)
-        self.energy_unit_var.set(eu)
+        pu, eu = unit_labels(self.probe_id())
+        self.power_unit_var.set(self.tr(pu))
+        self.energy_unit_var.set(self.tr(eu))
         self.update_display()
 
     def update_display(self):
@@ -921,8 +1057,8 @@ class MonitorApp:
                 kind = event['kind']
                 if kind == 'online':
                     self.connected = True
-                    self.status_var.set('模擬連線' if event['demo'] else '已連線：{} / {}'.format(self.port_var.get(), self.baud_var.get()))
-                    self.msg_var.set('連線成功，持續監測中；尚未正式錄製。')
+                    self.status_var.set(self.tr('模擬連線') if event['demo'] else '已連線：{} / {}'.format(self.port_var.get(), self.baud_var.get()))
+                    self.msg_var.set(self.tr('連線成功，持續監測中；尚未正式錄製。'))
                     self.state_buttons()
                     self.commands.put(('read_smoothing',))
                 elif kind == 'offline':
@@ -934,7 +1070,7 @@ class MonitorApp:
                     self.stop_event = None
                     self.start_pending = False
                     self.stop_pending = False
-                    self.status_var.set('未連線')
+                    self.status_var.set(self.tr('未連線'))
                     self.state_buttons()
                 elif kind == 'sample':
                     self.on_sample(event)
@@ -957,7 +1093,7 @@ class MonitorApp:
                     self.start_pending = False
                     self.stop_pending = False
                     self.recording = True
-                    self.msg_var.set('錄製中，開始時已透過 Register 50 重新計數。')
+                    self.msg_var.set(self.tr('錄製中，開始時已透過 Register 50 重新計數。'))
                     self.state_buttons()
                 elif kind == 'stopped':
                     self.recording = False
@@ -968,15 +1104,17 @@ class MonitorApp:
                     value = event['value']
                     if value in (0, 1, 2):
                         self.smooth_var.set({0: 'OFF / DC', 1: '50 Hz', 2: '60 Hz'}[value])
-                        self.smooth_choice.set(['0 - 不平滑 / DC', '1 - 50 Hz', '2 - 60 Hz'][value])
+                        self.smooth_choice.set(self.smoothing_options()[value])
+                        self.selected_smoothing = value
+                        self.save_preferences()
                     else:
-                        self.smooth_var.set('未知值 {}'.format(value))
+                        self.smooth_var.set(self.tr('未知值 {}').format(value))
                 elif kind in ('warning', 'notice', 'fatal'):
-                    self.msg_var.set(event['message'])
+                    self.msg_var.set(self.tr(event['message']))
                     if kind == 'fatal':
-                        messagebox.showerror('LS129 連線失敗', event['message'])
+                        messagebox.showerror(self.tr('LS129 連線失敗'), event['message'])
                 elif kind == 'operation_error':
-                    self.msg_var.set('操作失敗：{}'.format(event['message']))
+                    self.msg_var.set(self.tr('操作失敗：{}').format(event['message']))
                     if event['operation'] == 'start':
                         self.start_pending = False
                     if event['operation'] == 'stop':
@@ -984,7 +1122,7 @@ class MonitorApp:
                         self.recording = False
                         self.save_record('最後讀值失敗')
                     self.state_buttons()
-                    messagebox.showerror('Modbus 操作失敗', event['message'])
+                    messagebox.showerror(self.tr('Modbus 操作失敗'), event['message'])
                 elif kind == 'exchange':
                     self.last_frame = event['rx']
         finally:
@@ -995,7 +1133,8 @@ class MonitorApp:
             if now - self.draw_at > 0.25:
                 self.draw_graph()
                 self.draw_at = now
-            self.root.after(80, self.process_events)
+            if self.root.winfo_exists():
+                self._process_after_id = self.root.after(80, self.process_events)
 
     def on_sample(self, event):
         power, peak, energy = event['values']
@@ -1069,7 +1208,7 @@ class MonitorApp:
                 if (self.recording or self.stop_pending or self.samples) else
                 [(stamp - self.live_samples[0][0], p) for stamp, p in self.live_samples] if self.live_samples else [])
         if not data:
-            canvas.create_text((l + r) / 2, (t + b) / 2, text='等待即時量測數據...', fill='#8d98a8', font=('Arial', 12))
+            canvas.create_text((l + r) / 2, (t + b) / 2, text=self.tr('等待即時量測數據...'), fill='#8d98a8', font=('Arial', 12))
             return
         max_x = max(12.0, data[-1][0])
         min_x = max(0.0, max_x - 120.0)
@@ -1095,11 +1234,11 @@ class MonitorApp:
             else:
                 x, y = coords
                 canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill='#087bad', outline='')
-        canvas.create_text(l + 8, t + 8, anchor='nw', text='Raw LS129 (未修正)', fill='#087bad', font=('Arial', 10))
+        canvas.create_text(l + 8, t + 8, anchor='nw', text=self.tr('Raw LS129 (未修正)'), fill='#087bad', font=('Arial', 10))
 
     def save_record(self, reason):
         if not self.attempts:
-            self.msg_var.set('未進行有效輪詢，沒有建立檔案。')
+            self.msg_var.set(self.tr('未進行有效輪詢，沒有建立檔案。'))
             return
         folder = os.path.join(APP_DIR, 'Records')
         try:
@@ -1110,7 +1249,7 @@ class MonitorApp:
             if not os.path.exists(folder):
                 os.makedirs(folder)
         path = os.path.join(folder, self.measurement_id + '.csv')
-        power_unit, energy_unit = unit_labels(self.probe_var.get())
+        power_unit, energy_unit = unit_labels(self.probe_id())
         columns = ['measurement_id', 'poll_sequence', 'attempt_index', 'status', 'error', 'source',
                    'send_timestamp', 'receive_timestamp', 'elapsed_s', 'rx_gap_ms', 'round_trip_ms',
                    'target_poll_hz', 'duplicate_previous', 'consecutive_run',
@@ -1134,7 +1273,7 @@ class MonitorApp:
                         elapsed_s='{:.6f}'.format(sample['elapsed']),
                         rx_gap_ms='{:.3f}'.format(sample['rx_gap_ms']) if sample['rx_gap_ms'] is not None else '',
                         round_trip_ms='{:.3f}'.format(sample['rtt_ms']) if sample['rtt_ms'] is not None else '',
-                        target_poll_hz=int(self.poll_rate_var.get().split()[0]),
+                        target_poll_hz=self.poll_hz_live,
                         duplicate_previous='1' if sample['duplicate'] else '0' if success else '',
                         consecutive_run=sample['run_length'] if success else '',
                         power_raw=sample['power'] if success else '',
@@ -1143,26 +1282,31 @@ class MonitorApp:
                         power_pc=sample['power'] * factor if success else '',
                         peak_pc=sample['peak'] * factor if success else '',
                         energy_pc=sample['energy'] * factor if success else '', pc_factor=factor,
-                        power_unit=power_unit, energy_unit=energy_unit, probe_type=self.probe_var.get(),
+                        power_unit=power_unit, energy_unit=energy_unit, probe_type=self.probe_id(),
                         data_mode=self.mode_var.get(), slave_id=self.id_var.get(), baud_rate=self.baud_var.get(),
                         smoothing=self.smooth_var.get(), end_reason=reason,
                         request_hex=sample['tx_hex'], response_hex=sample['raw']))
             self.file_var.set(path)
-            self.msg_var.set('已儲存 {} 筆成功、{} 筆失敗：{}'.format(
+            self.msg_var.set(self.tr('已儲存 {} 筆成功、{} 筆失敗：{}').format(
                 len(self.samples), len(self.attempts)-len(self.samples), path))
         except Exception as exc:
-            self.msg_var.set('無法儲存：{}'.format(exc))
-            messagebox.showerror('存檔失敗', str(exc))
+            self.msg_var.set(self.tr('無法儲存：{}').format(exc))
+            messagebox.showerror(self.tr('存檔失敗'), str(exc))
 
     def close(self):
         if self.recording:
-            if not messagebox.askyesno('結束程式', '正在量測，關閉時會先儲存已取得的數據。確定嗎？'):
+            if not messagebox.askyesno(self.tr('結束程式'), self.tr('正在量測，關閉時會先儲存已取得的數據。確定嗎？')):
                 return
             self.recording = False
             self.save_record('程式關閉')
         self.save_preferences()
         if self.stop_event:
             self.stop_event.set()
+        if getattr(self, '_process_after_id', None) is not None:
+            try:
+                self.root.after_cancel(self._process_after_id)
+            except tk.TclError:
+                pass
         self.root.destroy()
 
 
@@ -1179,18 +1323,22 @@ def self_test():
     assert as_hex(frame(bytes.fromhex('01 06 00 32 00 01'))) == '01 06 00 32 00 01 E9 C5'
     assert display_number(21.267) == '21.3' and display_number(21) == '21.0'
     assert display_number(1.25) == '1.3' and display_number(-1.25) == '-1.3'
-    assert [fixed_poll_interval(hz) for hz in POLL_RATES] == [0.25, 0.2, 0.05]
+    assert [fixed_poll_interval(hz) for hz in (4,5,20,32,0.2)] == [0.25, 0.2, 0.05, 0.03125, 5.0]
+    for value in (0, -1, 33, 'nan', 'inf', 'hello'):
+        try: parse_poll_hz(value); raise AssertionError('Should reject invalid rate')
+        except ValueError: pass
     assert duplicate_frame('AB', 'AB') and not duplicate_frame('AB', 'AC')
     import tempfile
     with tempfile.TemporaryDirectory() as folder:
         cfg = os.path.join(folder, PREF_FILENAME)
         values = {'com_port':'COM9', 'probe_type':'UVALED', 'baud_rate':'9600',
-                  'slave_id':'1', 'data_mode':'FLOAT', 'poll_hz':20}
+                  'slave_id':'1', 'data_mode':'FLOAT', 'poll_hz':0.2,
+                  'smoothing_mode':2, 'language':'en'}
         assert write_preferences(values, [cfg]) == cfg
         restored, file_path, error = load_preferences([cfg])
         assert restored == values and file_path == cfg and error is None
         assert not normalize_preferences({'poll_hz':999, 'probe_type':'invalid', 'slave_id':999})
-    print('SELF TEST OK: CRC16, INT/FLOAT, rounding, 4/5/20 Hz, duplicate detection, config read/write')
+    print('SELF TEST OK: CRC16, INT/FLOAT, rounding, 0..32 Hz, trilingual, smoothing and config persistence')
 
 
 if __name__ == '__main__':
